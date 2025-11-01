@@ -1,8 +1,6 @@
 // --- MOCK DE DATOS (Simulación de Supabase PostgreSQL) ---
 // Los IDs son mockeados y autoincrementales para la simulación
-let nextClientId = 3;
-let nextProjectId = 4;
-let nextPaymentId = 5;
+
 let MOCK_DATA = {
     admin: { email: 'admin@mock.com', password: 'password' }, // Simulación de Supabase Auth
     clients: [
@@ -29,12 +27,29 @@ let MOCK_DATA = {
     ]
 };
 
+// Emails de administrador permitidos (pueden inyectarse desde index.html como window.ADMIN_EMAILS)
+const ADMIN_EMAILS = (window.ADMIN_EMAILS || [MOCK_DATA.admin.email]).map(e => String(e).toLowerCase());
+
+function isAdminUser(user) {
+    if (!user) return false;
+    const email = String(user.email || '').toLowerCase();
+    if (ADMIN_EMAILS.includes(email)) return true;
+    // revisar metadata si se configuró un role='admin'
+    try {
+        if (user.user_metadata && String(user.user_metadata.role).toLowerCase() === 'admin') return true;
+        if (user.app_metadata && String(user.app_metadata.role).toLowerCase() === 'admin') return true;
+    } catch (e) {
+        // ignore
+    }
+    return false;
+}
+
 // --- ESTADO DE LA APLICACIÓN ---
 const state = {
     currentView: 'login', // 'login', 'admin', 'client'
     clientData: null, // Datos del cliente si está en la vista 'client'
     isAdminAuthenticated: false,
-    adminSubView: 'clients', // 'clients', 'projects', 'payments', 'logs'
+    adminSubView: 'projects', // 'clients', 'projects', 'payments', 'logs'
     message: ''
 };
 
@@ -249,6 +264,7 @@ function handleAdminLogin() {
     if (email === MOCK_DATA.admin.email && password === MOCK_DATA.admin.password) {
         state.isAdminAuthenticated = true;
         logAction('ADMIN_LOGIN', 'Inicio de sesión exitoso.');
+        state.adminSubView = 'projects';
         setView('admin');
     } else {
         showMessage('Error de Autenticación', 'Credenciales inválidas. Por favor, intente de nuevo.');
@@ -257,9 +273,75 @@ function handleAdminLogin() {
 }
 
 function handleAdminLogout() {
+    // Si el admin está autenticado vía Supabase, cerrar la sesión de Supabase
+    if (state.user) {
+        // cierra sesión en Supabase y vuelve a la vista de login
+        handleUserSignOut();
+        logAction('ADMIN_LOGOUT', 'Cierre de sesión (Supabase).');
+        return;
+    }
+
+    // Flujo antiguo (mock)
     state.isAdminAuthenticated = false;
     logAction('ADMIN_LOGOUT', 'Cierre de sesión.');
     setView('login');
+}
+
+// --- INTEGRACIÓN CON SUPABASE (USUARIOS) ---
+
+async function handleUserSignUp() {
+    const email = document.getElementById('user-signup-email').value.trim();
+    const password = document.getElementById('user-signup-password').value.trim();
+    if (!email || !password) return showMessage('Error', 'Ingrese email y contraseña para registrarse.');
+
+    try {
+        const { data, error } = await window.supabase.auth.signUp({ email, password });
+        if (error) return showMessage('Error registro', error.message || JSON.stringify(error));
+
+        // Si la confirmación por email está habilitada, data.user existe pero session puede ser null
+        if (data?.session) {
+            state.user = data.session.user;
+            // Todas las sesiones autenticadas ven el panel admin
+            state.isAdminAuthenticated = true;
+            state.adminSubView = 'projects';
+            setView('admin');
+            showMessage('Registro exitoso', `Bienvenido ${state.user.email}`);
+        } else {
+            showMessage('Registro recibido', 'Revise su email para confirmar la cuenta si aplica.');
+        }
+    } catch (err) {
+        showMessage('Error', String(err));
+    }
+}
+
+async function handleUserSignIn() {
+    const email = document.getElementById('user-signin-email').value.trim();
+    const password = document.getElementById('user-signin-password').value.trim();
+    if (!email || !password) return showMessage('Error', 'Ingrese email y contraseña para iniciar sesión.');
+
+    try {
+        const { data, error } = await window.supabase.auth.signInWithPassword({ email, password });
+        if (error) return showMessage('Error login', error.message || JSON.stringify(error));
+        state.user = data.session?.user || data.user;
+        // Todas las sesiones autenticadas ven el panel admin
+        state.isAdminAuthenticated = true;
+        logAction('ADMIN_LOGIN', `Inicio de sesión: ${state.user.email}`);
+        state.adminSubView = 'projects';
+        setView('admin');
+        showMessage('Sesión iniciada', `Hola ${state.user.email}`);
+    } catch (err) {
+        showMessage('Error', String(err));
+    }
+}
+
+async function handleUserSignOut() {
+    try {
+        await window.supabase.auth.signOut();
+        state.user = null;
+        setView('login');
+    } catch (err) {
+        showMessage('Error', 'No fue posible cerrar la sesión.');
+    }
 }
 
 function printReport() {
@@ -270,29 +352,77 @@ function printReport() {
 
 /** RENDER: Vista de Login */
 function renderLogin() {
+    // Vista principal: login admin + enlaces a vistas separadas para usuario (login / register)
     return `
         <div class="flex items-center justify-center min-h-[80vh] print-area">
             <div class="w-full max-w-md bg-white p-8 rounded-xl shadow-lg border border-gray-200">
-                <h1 class="text-3xl font-extrabold text-center text-gray-900 mb-6">
-                    Acceso al Panel
-                </h1>
-                <p class="text-sm text-center text-gray-500 mb-6">
-                    Ingrese las credenciales de administrador (Simulación de Supabase Auth).
-                </p>
-                <form onsubmit="event.preventDefault(); handleAdminLogin();">
-                    <div class="mb-4">
-                        <label for="admin-email" class="block text-sm font-medium text-gray-700">Email</label>
-                        <input type="email" id="admin-email" value="admin@mock.com" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500" required>
+                <h2 class="text-2xl font-extrabold text-gray-900 mb-4">Acceso de Usuario</h2>
+                <p class="text-sm text-gray-500 mb-4">Inicia sesión o regístrate con tu cuenta (Supabase).</p>
+                <div class="space-y-3 mt-6">
+                    <button onclick="setView('user-login')" class="w-full bg-indigo-600 text-white py-2 px-4 rounded-lg font-semibold hover:bg-indigo-700">Login de Usuario</button>
+                    <button onclick="setView('user-register')" class="w-full bg-green-600 text-white py-2 px-4 rounded-lg font-semibold hover:bg-green-700">Registro de Usuario</button>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+/** RENDER: Vista de Login de Usuario (Supabase) */
+function renderUserLogin() {
+    return `
+        <div class="flex items-center justify-center min-h-[80vh]">
+            <div class="w-full max-w-md bg-white p-8 rounded-xl shadow-lg border border-gray-200">
+                <h2 class="text-2xl font-bold mb-4">Iniciar sesión (Usuario)</h2>
+                <p class="text-sm text-gray-500 mb-4">Ingrese sus credenciales para acceder.</p>
+                <form onsubmit="event.preventDefault(); handleUserSignIn();">
+                    <input id="user-signin-email" type="email" placeholder="Email" class="w-full p-3 border rounded-lg mb-3" required />
+                    <input id="user-signin-password" type="password" placeholder="Contraseña" class="w-full p-3 border rounded-lg mb-4" required />
+                    <div class="flex gap-3">
+                        <button type="submit" class="flex-1 bg-indigo-600 text-white py-2 rounded-lg">Entrar</button>
+                        <button type="button" onclick="setView('login')" class="flex-1 bg-gray-200 text-gray-700 py-2 rounded-lg">Volver</button>
                     </div>
-                    <div class="mb-6">
-                        <label for="admin-password" class="block text-sm font-medium text-gray-700">Contraseña</label>
-                        <input type="password" id="admin-password" value="password" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500" required>
-                    </div>
-                    <button type="submit" class="w-full bg-blue-600 text-white py-2 px-4 rounded-lg font-semibold hover:bg-blue-700 transition duration-150 shadow-md">
-                        Iniciar Sesión
-                    </button>
                 </form>
             </div>
+        </div>
+    `;
+}
+
+/** RENDER: Vista de Registro de Usuario (Supabase) */
+function renderUserRegister() {
+    return `
+        <div class="flex items-center justify-center min-h-[80vh]">
+            <div class="w-full max-w-md bg-white p-8 rounded-xl shadow-lg border border-gray-200">
+                <h2 class="text-2xl font-bold mb-4">Registro de Usuario</h2>
+                <p class="text-sm text-gray-500 mb-4">Crea una cuenta nueva con tu email y contraseña.</p>
+                <form onsubmit="event.preventDefault(); handleUserSignUp();">
+                    <input id="user-signup-email" type="email" placeholder="Email" class="w-full p-3 border rounded-lg mb-3" required />
+                    <input id="user-signup-password" type="password" placeholder="Contraseña" class="w-full p-3 border rounded-lg mb-4" required />
+                    <div class="flex gap-3">
+                        <button type="submit" class="flex-1 bg-green-600 text-white py-2 rounded-lg">Crear Cuenta</button>
+                        <button type="button" onclick="setView('login')" class="flex-1 bg-gray-200 text-gray-700 py-2 rounded-lg">Volver</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    `;
+}
+
+/** RENDER: Panel simple para usuario autenticado (Supabase) */
+function renderUserDashboard() {
+    const email = state.user?.email || 'Usuario';
+    return `
+        <div class="max-w-4xl mx-auto">
+            <header class="flex justify-between items-center mb-6">
+                <h1 class="text-2xl font-bold">Panel de Usuario</h1>
+                <div class="flex items-center gap-3">
+                    <span class="text-sm text-gray-600">${email}</span>
+                    <button onclick="handleUserSignOut()" class="bg-red-500 text-white py-2 px-3 rounded-lg">Cerrar sesión</button>
+                </div>
+            </header>
+            <main class="bg-white p-6 rounded-lg shadow-sm">
+                <p class="text-gray-700">Bienvenido, <strong>${email}</strong>. Este es un panel mínimo que confirma que la autenticación con Supabase funciona.</p>
+                <p class="text-sm text-gray-500 mt-4">Aquí podrías mostrar información protegida, llamadas a la API con Authorization: Bearer &lt;access_token&gt;, o links a la configuración de cuenta.</p>
+            </main>
         </div>
     `;
 }
@@ -679,6 +809,12 @@ function renderApp() {
         appDiv.innerHTML = renderLogin();
     } else if (state.currentView === 'admin') {
         appDiv.innerHTML = renderAdminDashboard();
+    } else if (state.currentView === 'user') {
+        appDiv.innerHTML = renderUserDashboard();
+    } else if (state.currentView === 'user-login') {
+        appDiv.innerHTML = renderUserLogin();
+    } else if (state.currentView === 'user-register') {
+        appDiv.innerHTML = renderUserRegister();
     } else if (state.currentView === 'client' && state.clientData) {
         appDiv.innerHTML = renderClientDashboard(state.clientData);
     } else {
@@ -700,6 +836,47 @@ function renderApp() {
 // --- INICIALIZACIÓN DE LA APLICACIÓN ---
 
 async function initializeApp() {
+    // Primero: si hay una sesión activa en Supabase, mostrar la vista de usuario
+    try {
+        if (window.supabase) {
+            const { data: { session } } = await window.supabase.auth.getSession();
+            if (session) {
+                state.user = session.user;
+                // Todas las sesiones autenticadas ven el panel admin
+                state.isAdminAuthenticated = true;
+                state.adminSubView = 'clients';
+                setView('admin');
+                return;
+            }
+        }
+    } catch (e) {
+        console.warn('No se pudo obtener sesión de Supabase', e);
+    }
+
+    // Suscribirse a cambios de estado de autenticación (útil para OAuth/magic links)
+    try {
+        if (window.supabase && typeof window.supabase.auth.onAuthStateChange === 'function') {
+            window.supabase.auth.onAuthStateChange((event, session) => {
+                console.log('Supabase auth event:', event);
+                state.user = session?.user || null;
+                if (event === 'SIGNED_IN') {
+                    // limpiar URL para evitar tokens en la barra de direcciones
+                    try { window.history.replaceState({}, document.title, window.location.pathname); } catch (e) { /* ignore */ }
+                    // Todas las sesiones autenticadas ven el panel admin
+                    state.isAdminAuthenticated = true;
+                    state.adminSubView = 'projects';
+                    setView('admin');
+                } else if (event === 'SIGNED_OUT') {
+                    state.user = null;
+                    state.isAdminAuthenticated = false;
+                    setView('login');
+                }
+            });
+        }
+    } catch (e) {
+        console.warn('No se pudo subscribir a onAuthStateChange', e);
+    }
+
     const params = new URLSearchParams(window.location.search);
     const token = params.get('token');
 
