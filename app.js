@@ -50,7 +50,8 @@ const state = {
     clientData: null, // Datos del cliente si está en la vista 'client'
     isAdminAuthenticated: false,
     adminSubView: 'projects', // 'clients', 'projects', 'payments', 'logs'
-    message: ''
+    message: '',
+    adminData: { clients: [], projects: [], payments: [] }
 };
 
 // --- UTILIDADES GLOBALES ---
@@ -82,6 +83,7 @@ function logAction(action, detail) {
 function setView(view, data = null) {
     state.currentView = view;
     state.clientData = data;
+    if (view === 'admin' && window.supabase) { loadAdminData(); }
     renderApp();
 }
 
@@ -145,12 +147,65 @@ async function generateTokenLink(clientId) {
 
 // --- LÓGICA DE GESTIÓN (CRUD MOCK - ADMIN) ---
 
+// --- INTEGRACIÓN SUPABASE CRUD (ADMIN) ---
+async function supabaseNextId(table) {
+    const { data, error } = await window.supabase.from(table).select('id').order('id', { ascending: false }).limit(1);
+    if (error) throw error;
+    return (data && data[0]?.id ? Number(data[0].id) + 1 : 1);
+}
+const statusIntToStr = (s) => Number(s) === 1 ? 'Activo' : 'Cerrado';
+const statusStrToInt = (s) => String(s) === 'Activo' ? 1 : 0;
+
+async function loadAdminData() {
+    if (!window.supabase) return;
+    try {
+        const [cliRes, projRes, payRes] = await Promise.all([
+            window.supabase.from('clients').select('id,name,email').order('id'),
+            window.supabase.from('projects').select('id,client_id,name,status,budget,balance').order('id'),
+            window.supabase.from('payments').select('id,project_id,date,amount,type').order('id')
+        ]);
+        if (cliRes.error) throw cliRes.error;
+        if (projRes.error) throw projRes.error;
+        if (payRes.error) throw payRes.error;
+        state.adminData.clients = (cliRes.data || []).map(c => ({ id: c.id, name: c.name, email: c.email }));
+        state.adminData.projects = (projRes.data || []).map(p => ({
+            id: p.id, clientId: p.client_id, name: p.name,
+            status: statusIntToStr(p.status), budget: Number(p.budget), balance: Number(p.balance)
+        }));
+        state.adminData.payments = (payRes.data || []).map(p => ({
+            id: p.id, projectId: p.project_id, date: p.date, amount: Number(p.amount), type: p.type
+        }));
+        renderApp();
+    } catch (e) {
+        console.warn('loadAdminData error', e);
+        showMessage('Error', 'No se pudo cargar datos desde la base.');
+    }
+}
+
 function addClient() {
     const name = document.getElementById('new-client-name').value.trim();
     const email = document.getElementById('new-client-email').value.trim();
 
     if (!name || !email) {
         showMessage('Error', 'Por favor, complete el nombre y el email del cliente.');
+        return;
+    }
+
+    if (window.supabase) {
+        (async () => {
+            try {
+                const id = await supabaseNextId('clients');
+                const { error } = await window.supabase.from('clients').insert([{ id, name, email }]);
+                if (error) throw error;
+                logAction('CLIENT_CREATE', `Cliente creado: ${name}`);
+                showMessage('Éxito', `Cliente ${name} agregado correctamente.`);
+                document.getElementById('new-client-name').value = '';
+                document.getElementById('new-client-email').value = '';
+                await loadAdminData();
+            } catch (e) {
+                showMessage('Error', String(e.message || e));
+            }
+        })();
         return;
     }
 
@@ -181,6 +236,24 @@ function addProject() {
         return;
     }
 
+    if (window.supabase) {
+        (async () => {
+            try {
+                const id = await supabaseNextId('projects');
+                const row = { id, client_id: Number(clientId), name, status: statusStrToInt(status), budget, balance: budget };
+                const { error } = await window.supabase.from('projects').insert([row]);
+                if (error) throw error;
+                logAction('PROJECT_CREATE', `Proyecto creado: ${name} (Cliente: ${clientId})`);
+                showMessage('Éxito', `Proyecto ${name} agregado correctamente. Balance inicial: ${formatCurrency(budget)}`);
+                form.reset();
+                await loadAdminData();
+            } catch (e) {
+                showMessage('Error', String(e.message || e));
+            }
+        })();
+        return;
+    }
+
     const newProject = {
         id: generateId('proj'),
         clientId: clientId,
@@ -203,6 +276,29 @@ function addPayment() {
     const amount = parseFloat(form['new-payment-amount'].value) || 0;
     const type = form['new-payment-type'].value;
     const date = new Date().toISOString().split('T')[0]; // Fecha actual
+
+    if (window.supabase) {
+        (async () => {
+            try {
+                const id = await supabaseNextId('payments');
+                const { error: insErr } = await window.supabase.from('payments').insert([{ id, project_id: Number(projectId), date, amount, type }]);
+                if (insErr) throw insErr;
+                const { data: proj, error: selErr } = await window.supabase.from('projects').select('id,balance').eq('id', Number(projectId)).single();
+                if (selErr) throw selErr;
+                const newBalance = Math.max(0, Number(proj.balance) - amount);
+                const newStatus = newBalance === 0 ? 0 : 1;
+                const { error: upErr } = await window.supabase.from('projects').update({ balance: newBalance, status: newStatus }).eq('id', Number(projectId));
+                if (upErr) throw upErr;
+                logAction('PAYMENT_CREATE', `Pago de ${formatCurrency(amount)} registrado para proyecto: ${projectId}`);
+                showMessage('Éxito', `Pago de ${formatCurrency(amount)} registrado. Balance actualizado: ${formatCurrency(newBalance)}`);
+                form.reset();
+                await loadAdminData();
+            } catch (e) {
+                showMessage('Error', String(e.message || e));
+            }
+        })();
+        return;
+    }
 
     const project = MOCK_DATA.projects.find(p => p.id === projectId);
 
@@ -235,6 +331,149 @@ function addPayment() {
     showMessage('Éxito', `Pago de **${formatCurrency(amount)}** registrado. Balance actualizado: ${formatCurrency(project.balance)}`);
     form.reset();
     renderApp();
+}
+
+// --- Edit/Update/Delete (CRUD extra) ---
+function editClient(id) {
+    const list = window.supabase ? state.adminData.clients : MOCK_DATA.clients;
+    const c = list.find(x => String(x.id) === String(id));
+    if (!c) return showMessage('Error', 'Cliente no encontrado');
+    const name = prompt('Nombre', c.name);
+    if (name === null) return;
+    const email = prompt('Email', c.email);
+    if (email === null) return;
+    if (window.supabase) {
+        (async () => {
+            try {
+                const { error } = await window.supabase.from('clients').update({ name, email }).eq('id', Number(id));
+                if (error) throw error;
+                await loadAdminData();
+            } catch (e) { showMessage('Error', String(e.message || e)); }
+        })();
+    } else {
+        c.name = name; c.email = email; renderApp();
+    }
+}
+
+function deleteClient(id) {
+    if (!confirm('¿Eliminar cliente? Esta acción puede requerir eliminar proyectos primero.')) return;
+    if (window.supabase) {
+        (async () => {
+            try {
+                const { data: pr } = await window.supabase.from('projects').select('id').eq('client_id', Number(id)).limit(1);
+                if (pr && pr.length) return showMessage('Bloqueado', 'Elimine proyectos del cliente primero.');
+                const { error } = await window.supabase.from('clients').delete().eq('id', Number(id));
+                if (error) throw error;
+                await loadAdminData();
+            } catch (e) { showMessage('Error', String(e.message || e)); }
+        })();
+    } else {
+        MOCK_DATA.clients = MOCK_DATA.clients.filter(x => String(x.id) !== String(id));
+        renderApp();
+    }
+}
+
+function editProject(id) {
+    const projs = window.supabase ? state.adminData.projects : MOCK_DATA.projects;
+    const clients = window.supabase ? state.adminData.clients : MOCK_DATA.clients;
+    const pays = window.supabase ? state.adminData.payments : MOCK_DATA.payments;
+    const p = projs.find(x => String(x.id) === String(id));
+    if (!p) return showMessage('Error', 'Proyecto no encontrado');
+    const name = prompt('Nombre', p.name); if (name === null) return;
+    const status = prompt("Estado ('Activo'/'Cerrado')", p.status); if (status === null) return;
+    const budgetStr = prompt('Presupuesto', String(p.budget)); if (budgetStr === null) return;
+    const budget = parseFloat(budgetStr) || 0;
+    const paidSum = pays.filter(x => String(x.projectId) === String(id)).reduce((s, x) => s + Number(x.amount), 0);
+    const newBalance = Math.max(0, budget - paidSum);
+    if (window.supabase) {
+        (async () => {
+            try {
+                const { error } = await window.supabase.from('projects').update({ name, status: statusStrToInt(status), budget, balance: newBalance }).eq('id', Number(id));
+                if (error) throw error;
+                await loadAdminData();
+            } catch (e) { showMessage('Error', String(e.message || e)); }
+        })();
+    } else {
+        p.name = name; p.status = status; p.budget = budget; p.balance = newBalance; renderApp();
+    }
+}
+
+function deleteProject(id) {
+    if (!confirm('¿Eliminar proyecto? Si tiene pagos, elimínelos primero.')) return;
+    if (window.supabase) {
+        (async () => {
+            try {
+                const { data: py } = await window.supabase.from('payments').select('id').eq('project_id', Number(id)).limit(1);
+                if (py && py.length) return showMessage('Bloqueado', 'Elimine pagos del proyecto primero.');
+                const { error } = await window.supabase.from('projects').delete().eq('id', Number(id));
+                if (error) throw error;
+                await loadAdminData();
+            } catch (e) { showMessage('Error', String(e.message || e)); }
+        })();
+    } else {
+        MOCK_DATA.projects = MOCK_DATA.projects.filter(x => String(x.id) !== String(id));
+        MOCK_DATA.payments = MOCK_DATA.payments.filter(x => String(x.projectId) !== String(id));
+        renderApp();
+    }
+}
+
+function editPayment(id) {
+    const pays = window.supabase ? state.adminData.payments : MOCK_DATA.payments;
+    const projs = window.supabase ? state.adminData.projects : MOCK_DATA.projects;
+    const pay = pays.find(x => String(x.id) === String(id));
+    if (!pay) return showMessage('Error', 'Pago no encontrado');
+    const date = prompt('Fecha (YYYY-MM-DD)', pay.date); if (date === null) return;
+    const type = prompt('Tipo', pay.type); if (type === null) return;
+    const amtStr = prompt('Monto', String(pay.amount)); if (amtStr === null) return;
+    const amount = parseFloat(amtStr) || 0;
+    const delta = amount - Number(pay.amount);
+    if (window.supabase) {
+        (async () => {
+            try {
+                const { error: upPayErr } = await window.supabase.from('payments').update({ date, type, amount }).eq('id', Number(id));
+                if (upPayErr) throw upPayErr;
+                const { data: proj } = await window.supabase.from('projects').select('balance').eq('id', Number(pay.projectId)).single();
+                const newBalance = Math.max(0, Number(proj.balance) - delta);
+                const newStatus = newBalance === 0 ? 0 : 1;
+                const { error: upProjErr } = await window.supabase.from('projects').update({ balance: newBalance, status: newStatus }).eq('id', Number(pay.projectId));
+                if (upProjErr) throw upProjErr;
+                await loadAdminData();
+            } catch (e) { showMessage('Error', String(e.message || e)); }
+        })();
+    } else {
+        const project = projs.find(x => String(x.id) === String(pay.projectId));
+        project.balance = Math.max(0, project.balance - delta);
+        project.status = project.balance === 0 ? 'Cerrado' : 'Activo';
+        pay.date = date; pay.type = type; pay.amount = amount; renderApp();
+    }
+}
+
+function deletePayment(id) {
+    if (!confirm('¿Eliminar pago?')) return;
+    const pays = window.supabase ? state.adminData.payments : MOCK_DATA.payments;
+    const projs = window.supabase ? state.adminData.projects : MOCK_DATA.projects;
+    const pay = pays.find(x => String(x.id) === String(id));
+    if (!pay) return showMessage('Error', 'Pago no encontrado');
+    if (window.supabase) {
+        (async () => {
+            try {
+                const { data: proj } = await window.supabase.from('projects').select('balance').eq('id', Number(pay.projectId)).single();
+                const newBalance = Math.max(0, Number(proj.balance) + Number(pay.amount));
+                const newStatus = newBalance === 0 ? 0 : 1;
+                const { error: upProjErr } = await window.supabase.from('projects').update({ balance: newBalance, status: newStatus }).eq('id', Number(pay.projectId));
+                if (upProjErr) throw upProjErr;
+                const { error } = await window.supabase.from('payments').delete().eq('id', Number(id));
+                if (error) throw error;
+                await loadAdminData();
+            } catch (e) { showMessage('Error', String(e.message || e)); }
+        })();
+    } else {
+        const project = projs.find(x => String(x.id) === String(pay.projectId));
+        project.balance = Math.max(0, project.balance + Number(pay.amount));
+        project.status = project.balance === 0 ? 'Cerrado' : 'Activo';
+        MOCK_DATA.payments = MOCK_DATA.payments.filter(x => String(x.id) !== String(id));
+        renderApp();
+    }
 }
 
 async function createClientLink(clientId) {
@@ -564,17 +803,20 @@ function renderClientDashboard(data) {
 
 /** RENDER: Panel de Administración (CRUD y Logs) */
 function renderAdminDashboard() {
-    const clientOptions = MOCK_DATA.clients.map(c => `<option value="${c.id}">${c.name} (${c.email})</option>`).join('');
-    const projectOptions = MOCK_DATA.projects.map(p => `<option value="${p.id}">${p.name} (${p.id})</option>`).join('');
+    const clients = window.supabase ? state.adminData.clients : MOCK_DATA.clients;
+    const projects = window.supabase ? state.adminData.projects : MOCK_DATA.projects;
+    const payments = window.supabase ? state.adminData.payments : MOCK_DATA.payments;
+    const clientOptions = clients.map(c => `<option value="${c.id}">${c.name} (${c.email})</option>`).join('');
+    const projectOptions = projects.map(p => `<option value="${p.id}">${p.name} (${p.id})</option>`).join('');
 
     const renderSubView = () => {
         switch (state.adminSubView) {
             case 'clients':
-                return renderAdminClients(clientOptions);
+                return renderAdminClients(clients);
             case 'projects':
-                return renderAdminProjects(clientOptions);
+                return renderAdminProjects(clientOptions, clients, projects);
             case 'payments':
-                return renderAdminPayments(projectOptions);
+                return renderAdminPayments(projectOptions, projects, payments);
             case 'logs':
                 return renderAdminLogs();
             default:
@@ -618,7 +860,7 @@ function renderAdminDashboard() {
 }
 
 /** RENDER: Sub-vista Admin - Clientes */
-function renderAdminClients(clientOptions) {
+function renderAdminClients(clients) {
     return `
         <h2 class="text-2xl font-bold mb-6 text-gray-800">Gestión de Clientes y Acceso</h2>
         
@@ -635,7 +877,7 @@ function renderAdminClients(clientOptions) {
         </div>
 
         <!-- Lista de Clientes -->
-        <h3 class="text-xl font-bold mb-4 text-gray-700">Lista de Clientes (${MOCK_DATA.clients.length})</h3>
+        <h3 class="text-xl font-bold mb-4 text-gray-700">Lista de Clientes (${clients.length})</h3>
         <div class="overflow-x-auto">
             <table class="min-w-full divide-y divide-gray-200">
                 <thead class="bg-gray-50">
@@ -646,14 +888,14 @@ function renderAdminClients(clientOptions) {
                     </tr>
                 </thead>
                 <tbody class="bg-white divide-y divide-gray-200">
-                    ${MOCK_DATA.clients.map(c => `
+                    ${clients.map(c => `
                         <tr>
                             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${c.name}</td>
                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${c.email}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-center no-print">
-                                <button onclick="createClientLink('${c.id}')" class="text-indigo-600 hover:text-indigo-900 font-medium text-sm">
-                                    Generar Link Acceso
-                                </button>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-center no-print space-x-2">
+                                ${window.supabase ? '' : `<button onclick=\"createClientLink('${c.id}')\" class=\"text-indigo-600 hover:text-indigo-900 font-medium text-sm\">Link</button>`}
+                                <button onclick="editClient(${JSON.stringify(c.id)})" class="text-blue-600 hover:text-blue-800 font-medium text-sm">Editar</button>
+                                <button onclick="deleteClient(${JSON.stringify(c.id)})" class="text-red-600 hover:text-red-800 font-medium text-sm">Eliminar</button>
                             </td>
                         </tr>
                     `).join('')}
@@ -664,7 +906,7 @@ function renderAdminClients(clientOptions) {
 }
 
 /** RENDER: Sub-vista Admin - Proyectos */
-function renderAdminProjects(clientOptions) {
+function renderAdminProjects(clientOptions, clients, projects) {
     return `
         <h2 class="text-2xl font-bold mb-6 text-gray-800">Gestión de Proyectos</h2>
 
@@ -689,7 +931,7 @@ function renderAdminProjects(clientOptions) {
         </div>
 
         <!-- Lista de Proyectos -->
-        <h3 class="text-xl font-bold mb-4 text-gray-700">Proyectos Registrados (${MOCK_DATA.projects.length})</h3>
+        <h3 class="text-xl font-bold mb-4 text-gray-700">Proyectos Registrados (${projects.length})</h3>
         <div class="overflow-x-auto">
             <table class="min-w-full divide-y divide-gray-200">
                 <thead class="bg-gray-50">
@@ -699,11 +941,12 @@ function renderAdminProjects(clientOptions) {
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Presupuesto</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Balance Pendiente</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Estado</th>
+                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider no-print">Acciones</th>
                     </tr>
                 </thead>
                 <tbody class="bg-white divide-y divide-gray-200">
-                    ${MOCK_DATA.projects.map(p => {
-                        const client = MOCK_DATA.clients.find(c => c.id === p.clientId) || { name: 'N/A' };
+                    ${projects.map(p => {
+                        const client = clients.find(c => c.id === p.clientId) || { name: 'N/A' };
                         const statusColor = p.status === 'Activo' ? 'text-green-600 bg-green-100' : 'text-gray-600 bg-gray-100';
                         return `
                             <tr>
@@ -716,6 +959,10 @@ function renderAdminProjects(clientOptions) {
                                         ${p.status}
                                     </span>
                                 </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-center no-print space-x-2">
+                                    <button onclick="editProject(${JSON.stringify(p.id)})" class="text-blue-600 hover:text-blue-800 font-medium text-sm">Editar</button>
+                                    <button onclick="deleteProject(${JSON.stringify(p.id)})" class="text-red-600 hover:text-red-800 font-medium text-sm">Eliminar</button>
+                                </td>
                             </tr>
                         `;
                     }).join('')}
@@ -726,7 +973,7 @@ function renderAdminProjects(clientOptions) {
 }
 
 /** RENDER: Sub-vista Admin - Pagos */
-function renderAdminPayments(projectOptions) {
+function renderAdminPayments(projectOptions, projects, payments) {
     return `
         <h2 class="text-2xl font-bold mb-6 text-gray-800">Gestión de Pagos</h2>
 
@@ -738,7 +985,7 @@ function renderAdminPayments(projectOptions) {
                     <option value="">-- Seleccionar Proyecto --</option>
                     ${projectOptions}
                 </select>
-                <input type="number" name="new-payment-amount" placeholder="Monto del Pago" step="100" min="1" class="p-2 border rounded-lg" required>
+                <input type="number" name="new-payment-amount" placeholder="Monto del Pago" step="any" min="1" class="p-2 border rounded-lg" required>
                 <select name="new-payment-type" class="p-2 border rounded-lg">
                     <option value="Inicial">Pago Inicial</option>
                     <option value="Hito">Hito de Proyecto</option>
@@ -751,7 +998,7 @@ function renderAdminPayments(projectOptions) {
         </div>
 
         <!-- Historial de Pagos -->
-        <h3 class="text-xl font-bold mb-4 text-gray-700">Historial de Pagos (${MOCK_DATA.payments.length})</h3>
+        <h3 class="text-xl font-bold mb-4 text-gray-700">Historial de Pagos (${payments.length})</h3>
         <div class="overflow-x-auto">
             <table class="min-w-full divide-y divide-gray-200">
                 <thead class="bg-gray-50">
@@ -763,8 +1010,8 @@ function renderAdminPayments(projectOptions) {
                     </tr>
                 </thead>
                 <tbody class="bg-white divide-y divide-gray-200">
-                    ${MOCK_DATA.payments.map(p => {
-                        const project = MOCK_DATA.projects.find(proj => proj.id === p.projectId) || { name: 'N/A' };
+                    ${payments.map(p => {
+                        const project = projects.find(proj => proj.id === p.projectId) || { name: 'N/A' };
                         return `
                             <tr>
                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${p.date}</td>
